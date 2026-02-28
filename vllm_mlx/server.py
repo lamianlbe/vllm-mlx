@@ -111,6 +111,7 @@ logger = logging.getLogger(__name__)
 # Global engine instance
 _engine: BaseEngine | None = None
 _model_name: str | None = None
+_model_path: str | None = None  # Actual model path (for cache dir, not affected by --served-model-name)
 _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
@@ -188,11 +189,12 @@ def _save_prefix_cache_to_disk() -> None:
 
 
 def _get_cache_dir() -> str:
-    """Get cache persistence directory based on model name."""
-    # Use global _model_name which is always a string, set during load_model()
-    model_name = _model_name if _model_name else "default"
+    """Get cache persistence directory based on actual model path."""
+    # Use _model_path (actual model path) not _model_name (which may be overridden
+    # by --served-model-name). This ensures cache is shared regardless of served name.
+    model_name = _model_path if _model_path else (_model_name if _model_name else "default")
     logger.info(
-        f"[_get_cache_dir] _model_name={_model_name!r} type={type(_model_name)}"
+        f"[_get_cache_dir] _model_path={_model_path!r} type={type(_model_path)}"
     )
     # Sanitize model name for filesystem
     safe_name = str(model_name).replace("/", "--").replace("\\", "--")
@@ -490,9 +492,10 @@ def load_model(
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
     """
-    global _engine, _model_name, _default_max_tokens, _tool_parser_instance
+    global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
 
     _default_max_tokens = max_tokens
+    _model_path = model_name
     _model_name = served_model_name or model_name
     # Reset tool parser instance when model is reloaded (tokenizer may change)
     _tool_parser_instance = None
