@@ -197,6 +197,7 @@ def serve_command(args):
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        served_model_name=args.served_model_name,
         mtp=args.enable_mtp,
         prefill_step_size=args.prefill_step_size,
         specprefill_enabled=args.specprefill,
@@ -607,6 +608,12 @@ Examples:
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
     serve_parser.add_argument("model", type=str, help="Model to serve")
+    serve_parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="The model name used in the API. If not specified, the model argument is used.",
+    )
     serve_parser.add_argument(
         "--host", type=str, default="0.0.0.0", help="Host to bind"
     )
