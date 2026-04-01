@@ -8,7 +8,6 @@ crashes from Qwen 3.5 and Llama templates that require alternating roles.
 """
 
 
-
 class TestNormalizeMessages:
     """Test _normalize_messages() for handling real-world client formats."""
 
