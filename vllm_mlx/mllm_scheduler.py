@@ -477,8 +477,8 @@ class MLLMScheduler:
             request.num_output_tokens = len(request.output_tokens)
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
-            # Skip stop tokens — they are not content.
-            if response.finish_reason == "stop":
+            # Skip stop tokens and error placeholders — they are not content.
+            if response.finish_reason in ("stop", "error"):
                 new_text = ""
             else:
                 if request_id not in self._detokenizer_pool:
@@ -508,6 +508,8 @@ class MLLMScheduler:
                     request.status = RequestStatus.FINISHED_STOPPED
                 elif response.finish_reason == "length":
                     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                elif response.finish_reason == "error":
+                    request.status = RequestStatus.FINISHED_ABORTED
 
                 output.finished = True
                 output.finish_reason = response.finish_reason

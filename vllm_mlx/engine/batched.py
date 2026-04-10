@@ -97,9 +97,8 @@ class MLLMModelWrapper:
         self._model = model
         # Detect if this is a Gemma 3/4 model (requires pixel_values as positional arg)
         model_type = str(getattr(model, "model_type", "")).lower()
-        self._is_gemma_multimodal = (
-            hasattr(model, "model_type")
-            and ("gemma3" in model_type or "gemma4" in model_type)
+        self._is_gemma_multimodal = hasattr(model, "model_type") and (
+            "gemma3" in model_type or "gemma4" in model_type
         )
 
     def __call__(self, *args, **kwargs):
