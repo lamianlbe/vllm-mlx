@@ -153,8 +153,7 @@ Note: Make sure the vllm-mlx server is running:
         type=str,
         default="default",
         help=(
-            "Model name to send in /v1/chat/completions requests "
-            "(default: default)"
+            "Model name to send in /v1/chat/completions requests " "(default: default)"
         ),
     )
     args = parser.parse_args()
