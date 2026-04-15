@@ -44,7 +44,7 @@ dependencies = [
     # Video processing for VLM
     "opencv-python>=4.8.0",
     # Vision processor (required for transformers AutoProcessor)
-    "torchvision>=0.21.0",
+    "torchvision>=0.23.0",
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
@@ -75,8 +75,8 @@ vllm = [
     "vllm>=0.4.0",
 ]
 vision = [
-    "torch>=2.3.0",
-    "torchvision>=0.21.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [
