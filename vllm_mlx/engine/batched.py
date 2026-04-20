@@ -472,9 +472,12 @@ class BatchedEngine(BaseEngine):
             template_applicator = self.tokenizer
 
         if template_applicator is not None:
-            # Convert OpenAI image_url content parts to HuggingFace format
-            # so the processor can insert the correct vision placeholder tokens.
-            if self._is_mllm and num_images > 0:
+            # Convert OpenAI image_url / video_url content parts to HuggingFace
+            # format so the processor can insert the correct vision placeholder
+            # tokens. Image and video tokens are DIFFERENT on Qwen-VL
+            # (<|image_pad|> vs <|video_pad|>), so we must tell the template
+            # apart per-part, not just count them together.
+            if self._is_mllm:
                 messages = self._prepare_mllm_messages(messages)
 
             # Per-request enable_thinking override; default: True unless coder model.
@@ -515,18 +518,24 @@ class BatchedEngine(BaseEngine):
     def _prepare_mllm_messages(
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Convert OpenAI-style image_url content to HuggingFace format.
+        """Convert OpenAI-style image/video content to HuggingFace format.
 
-        The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
-        while HuggingFace processors expect ``{"type": "image"}``.
+        OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
+        and ``{"type": "video_url", "video_url": {"url": ...}}``. HuggingFace
+        processors (e.g. Qwen-VL) expect ``{"type": "image"}`` /
+        ``{"type": "video"}``. These are different placeholder tokens at the
+        chat-template level (<|image_pad|> vs <|video_pad|> for Qwen-VL), so
+        a single untyped count isn't enough — we must preserve part order and
+        type. Already-HF parts (``{"type": "image"}`` / ``{"type": "video"}``)
+        pass through unchanged.
 
         Args:
-            messages: List of chat messages in OpenAI format. Each message is a
-                dict with at least ``role`` and ``content`` keys.
+            messages: List of chat messages in OpenAI format. Each message is
+                a dict with at least ``role`` and ``content`` keys.
 
         Returns:
-            A new list of messages with ``image_url`` parts replaced by
-            ``{"type": "image"}`` entries for the HuggingFace processor.
+            A new list of messages with image_url / video_url parts replaced
+            by their HF placeholders.
         """
         prepared = []
         for msg in messages:
@@ -536,9 +545,15 @@ class BatchedEngine(BaseEngine):
             if isinstance(content, list):
                 new_content = []
                 for part in content:
-                    if isinstance(part, dict) and part.get("type") == "image_url":
-                        new_content.append({"type": "image"})
-                    elif isinstance(part, (dict, str)):
+                    if isinstance(part, dict):
+                        ptype = part.get("type")
+                        if ptype == "image_url":
+                            new_content.append({"type": "image"})
+                            continue
+                        if ptype == "video_url":
+                            new_content.append({"type": "video"})
+                            continue
+                    if isinstance(part, (dict, str)):
                         new_content.append(part)
                     # skip non-dict/non-str parts to avoid passing unexpected types
                 prepared.append({**msg, "content": new_content})

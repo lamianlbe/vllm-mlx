@@ -699,16 +699,38 @@ class MLLMBatchGenerator:
             r for r in self.unprocessed_requests if r.uid not in uid_set
         ]
 
+    def _is_video_native(self) -> bool:
+        """Whether this model has a dedicated video token (e.g. Qwen2-VL /
+        Qwen2.5-VL / Qwen3-VL). For these, we want to go through the
+        processor's ``videos=`` path so it emits ``pixel_values_videos`` +
+        ``video_grid_thw`` — giving the model real temporal positional info
+        instead of treating frames as an unordered image bag.
+        """
+        cfg = getattr(self.model, "config", None)
+        if cfg is None:
+            return False
+        return hasattr(cfg, "video_token_id") or hasattr(cfg, "video_token_index")
+
     def _preprocess_request(self, request: MLLMBatchRequest) -> None:
         """
         Preprocess a single MLLM request (vision encoding).
 
-        This prepares the inputs by:
-        1. Processing images/videos through the processor
-        2. Tokenizing the prompt with image tokens
-        3. Running vision encoder to get features
+        Two code paths:
 
-        Uses vision cache to skip processing for repeated images.
+        * **Video-native** (Qwen-VL family, request has videos): run
+          ``mlx_vlm.video_generate.process_vision_info`` to decode each video
+          with cv2 into a ``(T,C,H,W)`` numpy array, then call
+          ``processor(text, images=..., videos=..., return_tensors="pt")``
+          directly. This yields ``pixel_values_videos`` + ``video_grid_thw``,
+          which the model uses with proper temporal embedding.
+
+        * **Image / fallback**: the previous behaviour — extract frames via
+          cv2 and treat them as an image list through ``prepare_inputs``.
+          Used for any model without ``video_token_id`` / ``video_token_index``
+          and for text-only + image-only requests.
+
+        Uses the vision cache for either path (key includes video paths with
+        a ``video://`` prefix so they don't collide with images).
 
         Args:
             request: Request to preprocess
@@ -717,8 +739,17 @@ class MLLMBatchGenerator:
 
         tic = time.perf_counter()
 
-        # Collect all images (including video frames)
-        all_images = []
+        # Decide path early: only the video-native branch uses processor(videos=).
+        has_videos = bool(request.videos)
+        use_native_video = has_videos and self._is_video_native()
+
+        # --------------------------------------------------------------------
+        # Collect all inputs. For the cache key we always produce a flat
+        # string list so the existing vision cache keeps working; images use
+        # their path, videos get a ``video://`` prefix.
+        # --------------------------------------------------------------------
+        all_images: list[str] = []  # resolved image paths (or video-frame paths in fallback)
+        cache_key_items: list[str] = []  # what we hash for the pixel cache
 
         if request.images:
             from .models.mllm import process_image_input
@@ -727,35 +758,31 @@ class MLLMBatchGenerator:
                 try:
                     path = process_image_input(img)
                     all_images.append(path)
+                    cache_key_items.append(path)
                 except Exception as e:
                     logger.warning(f"Failed to process image: {e}")
 
-        if request.videos:
-            from .models.mllm import (
-                process_video_input,
-                extract_video_frames_smart,
-                save_frames_to_temp,
-                DEFAULT_FPS,
-                MAX_FRAMES,
-            )
+        # Pre-resolve video inputs (URL/base64 → local path) so we can cache
+        # on the local path string regardless of which code path we take.
+        resolved_video_paths: list[str] = []
+        if has_videos:
+            from .models.mllm import process_video_input
 
-            for video in request.videos:
+            for video in request.videos or []:
                 try:
-                    video_path = process_video_input(video)
-                    frames = extract_video_frames_smart(
-                        video_path,
-                        fps=DEFAULT_FPS,
-                        max_frames=MAX_FRAMES,
-                    )
-                    frame_paths = save_frames_to_temp(frames)
-                    all_images.extend(frame_paths)
+                    resolved_video_paths.append(process_video_input(video))
                 except Exception as e:
                     logger.warning(f"Failed to process video: {e}")
 
-        # Check pixel cache first
-        cached_pixels = self.vision_cache.get_pixel_cache(all_images, request.prompt)
+        for vp in resolved_video_paths:
+            cache_key_items.append(f"video://{vp}")
+
+        # --------------------------------------------------------------------
+        # Pixel cache lookup (works for both paths since the key is based on
+        # input identity, not the internal tensor shape).
+        # --------------------------------------------------------------------
+        cached_pixels = self.vision_cache.get_pixel_cache(cache_key_items, request.prompt)
         if cached_pixels is not None:
-            # Cache hit - use cached pixel values
             request.input_ids = cached_pixels.input_ids
             request.pixel_values = cached_pixels.pixel_values
             request.attention_mask = cached_pixels.attention_mask
@@ -768,39 +795,171 @@ class MLLMBatchGenerator:
             )
             return
 
-        # Cache miss - process images
-        # Get model config
         model_config = getattr(self.model, "config", None)
-        image_token_index = (
-            getattr(model_config, "image_token_index", None) if model_config else None
-        )
 
-        # Prepare inputs using mlx_vlm
-        inputs = prepare_inputs(
-            self.processor,
-            images=all_images if all_images else None,
-            prompts=request.prompt,
-            image_token_index=image_token_index,
-        )
+        if use_native_video:
+            # ----------------------------------------------------------------
+            # Native video path. Build a synthetic vision-info message so
+            # `process_vision_info` decodes each video into a (T,C,H,W) numpy
+            # array with cv2, respecting `fps` / `max_pixels` / etc. Then we
+            # call the HF processor directly with both images and videos.
+            # ----------------------------------------------------------------
+            try:
+                from mlx_vlm.video_generate import process_vision_info, FPS as _VIDEO_FPS
+            except Exception as e:  # pragma: no cover — upstream API moved
+                logger.warning(
+                    f"video_generate.process_vision_info unavailable ({e}); "
+                    "falling back to image-frame path"
+                )
+                use_native_video = False
 
-        request.input_ids = inputs.get("input_ids")
-        request.pixel_values = inputs.get("pixel_values")
-        request.attention_mask = inputs.get("attention_mask")
+        if use_native_video:
+            synthetic_content: list[dict] = []
+            for p in all_images:
+                synthetic_content.append({"type": "image", "image": p})
+            for vp in resolved_video_paths:
+                synthetic_content.append({
+                    "type": "video",
+                    "video": vp,
+                    "fps": _VIDEO_FPS,
+                })
+            synthetic_messages = [{"role": "user", "content": synthetic_content}]
 
-        # Extract extra kwargs
-        request.extra_kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-        request.image_grid_thw = request.extra_kwargs.pop("image_grid_thw", None)
+            try:
+                image_inputs, video_inputs, video_kwargs = process_vision_info(
+                    synthetic_messages, return_video_kwargs=True
+                )
+            except Exception as e:
+                logger.warning(
+                    f"process_vision_info failed ({e}); "
+                    "falling back to image-frame path"
+                )
+                use_native_video = False
+
+        if use_native_video:
+            try:
+                inputs = self.processor(
+                    text=[request.prompt],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                )
+            except Exception as e:
+                logger.warning(
+                    f"processor(videos=...) failed ({e}); "
+                    "falling back to image-frame path"
+                )
+                use_native_video = False
+
+        if use_native_video:
+            # Prefer `pixel_values_videos` (the dedicated video tensor that
+            # matches `video_grid_thw`); fall back to plain `pixel_values`
+            # if the processor only returned that (some HF configs merge).
+            def _to_mx(x):
+                if x is None:
+                    return None
+                if isinstance(x, mx.array):
+                    return x
+                try:
+                    import numpy as _np
+                    if not isinstance(x, _np.ndarray):
+                        # torch tensor on MPS/CUDA needs .cpu() before .numpy();
+                        # CPU torch tensors accept .numpy() directly. Others
+                        # (e.g. list) go through np.asarray.
+                        if hasattr(x, "detach") and hasattr(x, "cpu"):
+                            x = x.detach().cpu().numpy()
+                        elif hasattr(x, "numpy"):
+                            x = x.numpy()
+                        else:
+                            x = _np.asarray(x)
+                    return mx.array(x)
+                except Exception:
+                    return mx.array(x)
+
+            request.input_ids = _to_mx(inputs.get("input_ids"))
+            request.attention_mask = _to_mx(inputs.get("attention_mask"))
+
+            pv_videos = inputs.get("pixel_values_videos")
+            pv_images = inputs.get("pixel_values")
+            # Store videos pixels if present, otherwise images. (It's unusual
+            # to have BOTH in one request — images alongside a video — but
+            # the downstream model path only consumes one pixel tensor, so if
+            # both exist we attach videos and pass images through extras.)
+            request.pixel_values = _to_mx(pv_videos if pv_videos is not None else pv_images)
+
+            extras: Dict[str, Any] = {}
+            for k, v in inputs.items():
+                if k in ("input_ids", "attention_mask", "pixel_values", "pixel_values_videos"):
+                    continue
+                extras[k] = _to_mx(v) if k.endswith("_grid_thw") else v
+            if pv_videos is not None and pv_images is not None:
+                # Keep images around for models that accept both; downstream
+                # code that doesn't understand this simply ignores it.
+                extras["pixel_values_images"] = _to_mx(pv_images)
+            # image_grid_thw lives on request directly (existing contract);
+            # video_grid_thw goes into extra_kwargs so the model's forward
+            # pass can pick it up via **kwargs.
+            request.image_grid_thw = extras.pop("image_grid_thw", None)
+            request.extra_kwargs = extras
+
+            logger.debug(
+                f"Native video path for request {request.request_id}: "
+                f"{len(resolved_video_paths)} video(s), "
+                f"pv_videos={pv_videos is not None}, "
+                f"video_grid_thw={'video_grid_thw' in extras}"
+            )
+        else:
+            # Fallback / image-only path (original behaviour).
+            if has_videos:
+                # Model isn't video-native: extract frames and treat as images.
+                from .models.mllm import (
+                    extract_video_frames_smart,
+                    save_frames_to_temp,
+                    DEFAULT_FPS,
+                    MAX_FRAMES,
+                )
+
+                for video_path in resolved_video_paths:
+                    try:
+                        frames = extract_video_frames_smart(
+                            video_path,
+                            fps=DEFAULT_FPS,
+                            max_frames=MAX_FRAMES,
+                        )
+                        frame_paths = save_frames_to_temp(frames)
+                        all_images.extend(frame_paths)
+                    except Exception as e:
+                        logger.warning(f"Failed to process video: {e}")
+
+            image_token_index = (
+                getattr(model_config, "image_token_index", None) if model_config else None
+            )
+
+            inputs = prepare_inputs(
+                self.processor,
+                images=all_images if all_images else None,
+                prompts=request.prompt,
+                image_token_index=image_token_index,
+            )
+
+            request.input_ids = inputs.get("input_ids")
+            request.pixel_values = inputs.get("pixel_values")
+            request.attention_mask = inputs.get("attention_mask")
+
+            request.extra_kwargs = {
+                k: v
+                for k, v in inputs.items()
+                if k not in ["input_ids", "pixel_values", "attention_mask"]
+            }
+            request.image_grid_thw = request.extra_kwargs.pop("image_grid_thw", None)
 
         processing_time = time.perf_counter() - tic
 
         # Store in pixel cache for future reuse
-        if all_images and request.pixel_values is not None:
+        if cache_key_items and request.pixel_values is not None:
             self.vision_cache.set_pixel_cache(
-                images=all_images,
+                images=cache_key_items,
                 prompt=request.prompt,
                 pixel_values=request.pixel_values,
                 input_ids=request.input_ids,
@@ -810,11 +969,13 @@ class MLLMBatchGenerator:
                 processing_time=processing_time,
             )
 
-        self._stats.num_images_processed += len(all_images)
+        # Stats: count image units. For native-video we count each video as 1
+        # unit (there's no "frame count" to bill against an image budget).
+        self._stats.num_images_processed += len(cache_key_items)
         self._stats.vision_encoding_time += processing_time
 
         # Mark text-only requests (eligible for prefix cache)
-        request.is_text_only = not bool(all_images)
+        request.is_text_only = not bool(cache_key_items)
 
         logger.debug(
             f"Preprocessed request {request.request_id}: "
