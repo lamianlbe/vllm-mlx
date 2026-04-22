@@ -92,6 +92,10 @@ class MLLMRequest:
     prompt: str
     images: Optional[List[str]] = None
     videos: Optional[List[str]] = None
+    # Per-request video sampling knobs. `None` = use mlx-vlm defaults
+    # (fps=2.0, max_frames=128 at time of writing).
+    video_fps: Optional[float] = None
+    video_max_frames: Optional[int] = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     arrival_time: float = field(default_factory=time.time)
 
@@ -372,6 +376,8 @@ class MLLMScheduler:
             prompt=prompt,
             images=images,
             videos=videos,
+            video_fps=kwargs.pop("video_fps", None),
+            video_max_frames=kwargs.pop("video_max_frames", None),
             sampling_params=sampling_params,
         )
 
@@ -505,6 +511,11 @@ class MLLMScheduler:
                 prompt=request.prompt,
                 images=request.images,
                 videos=request.videos,
+                # Forward per-request video sampling knobs so native-video
+                # preprocessing respects the client's extra_body.video_fps /
+                # video_max_frames (instead of silently using mlx-vlm defaults).
+                video_fps=getattr(request, "video_fps", None),
+                video_max_frames=getattr(request, "video_max_frames", None),
                 max_tokens=request.sampling_params.max_tokens,
                 temperature=request.sampling_params.temperature,
                 top_p=request.sampling_params.top_p,

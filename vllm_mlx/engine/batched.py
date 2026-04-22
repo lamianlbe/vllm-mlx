@@ -607,6 +607,10 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                # Forward client-supplied video sampling knobs (see streaming
+                # path for the same forwarding).
+                video_fps=kwargs.pop("video_fps", None),
+                video_max_frames=kwargs.pop("video_max_frames", None),
             )
 
             return GenerationOutput(
@@ -691,6 +695,11 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                # Forward client-supplied video sampling knobs — previously
+                # dropped here, so every request used the mlx-vlm default
+                # FPS=2.0 regardless of the extra_body.video_fps.
+                video_fps=kwargs.pop("video_fps", None),
+                video_max_frames=kwargs.pop("video_max_frames", None),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):

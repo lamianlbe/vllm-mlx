@@ -53,6 +53,10 @@ class MLLMBatchRequest:
     prompt: str  # Text prompt
     images: Optional[List[str]] = None  # Image paths/URLs/base64
     videos: Optional[List[str]] = None  # Video inputs
+    # Per-request video sampling knobs (forwarded from the client via
+    # extra_body; `None` means "use mlx-vlm's defaults").
+    video_fps: Optional[float] = None
+    video_max_frames: Optional[int] = None
     max_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
@@ -814,15 +818,21 @@ class MLLMBatchGenerator:
                 use_native_video = False
 
         if use_native_video:
+            # Per-request sampling — fall back to mlx-vlm's default FPS=2.0
+            # constant only when the caller didn't supply its own video_fps.
+            # BEFORE THIS FIX: every native-video request silently used 2.0
+            # regardless of what the client asked for via extra_body.video_fps.
+            req_fps = request.video_fps if request.video_fps is not None else _VIDEO_FPS
             synthetic_content: list[dict] = []
             for p in all_images:
                 synthetic_content.append({"type": "image", "image": p})
             for vp in resolved_video_paths:
-                synthetic_content.append({
-                    "type": "video",
-                    "video": vp,
-                    "fps": _VIDEO_FPS,
-                })
+                ve = {"type": "video", "video": vp, "fps": req_fps}
+                # process_vision_info / fetch_video honour `max_frames` as a
+                # hard cap on the sampled frame count.
+                if request.video_max_frames is not None:
+                    ve["max_frames"] = request.video_max_frames
+                synthetic_content.append(ve)
             synthetic_messages = [{"role": "user", "content": synthetic_content}]
 
             try:
