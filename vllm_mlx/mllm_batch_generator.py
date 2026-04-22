@@ -837,14 +837,47 @@ class MLLMBatchGenerator:
                 use_native_video = False
 
         if use_native_video:
+            # `video_kwargs` from process_vision_info carries per-video fps
+            # and (optionally) video_metadata. HF processors need these to
+            # sample the right frames; without them transformers warns
+            #   "Asked to sample `fps` frames per second but no video_metadata
+            #    was provided... Defaulting to fps=24"
+            # and silently resamples at 24 fps, which can shift the frame
+            # indices by ~50% on a 16 fps video like ours.
+            proc_kwargs = dict(
+                text=[request.prompt],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            if isinstance(video_kwargs, dict):
+                # Forward every key returned by process_vision_info. Known
+                # keys today: fps (list), video_metadata (list). Treat this
+                # as a forward-compat dict — upstream may add more.
+                for k, v in video_kwargs.items():
+                    # Don't clobber our explicit kwargs.
+                    if k not in proc_kwargs:
+                        proc_kwargs[k] = v
             try:
-                inputs = self.processor(
-                    text=[request.prompt],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
+                inputs = self.processor(**proc_kwargs)
+            except TypeError as e:
+                # Older HF processor may not accept fps / video_metadata kwargs;
+                # strip them and retry rather than dropping to the image-frame
+                # path (that would lose temporal info).
+                logger.warning(
+                    f"processor rejected video_kwargs ({e}); retrying without them"
                 )
+                for k in ("fps", "video_metadata"):
+                    proc_kwargs.pop(k, None)
+                try:
+                    inputs = self.processor(**proc_kwargs)
+                except Exception as e2:
+                    logger.warning(
+                        f"processor(videos=...) failed ({e2}); "
+                        "falling back to image-frame path"
+                    )
+                    use_native_video = False
             except Exception as e:
                 logger.warning(
                     f"processor(videos=...) failed ({e}); "
